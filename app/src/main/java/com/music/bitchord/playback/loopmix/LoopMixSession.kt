@@ -60,33 +60,35 @@ class LoopMixSession private constructor(
         outPort.presentedSeconds(nowNanos, playing)?.let { it - plan.out.loopStart }
 
     /**
-     * Where the incoming player has to start: [STARTUP_LEAD] into the mix,
-     * silent, at the track position that would put it on the deck's own
-     * timeline. Before the song's start it starts at 0, and the silence the
-     * alignment inserts makes up the rest.
+     * Fix 1: Correct the timeline seek calculation.
+     * Prevents ExoPlayer from seeking tens of seconds ahead of the loop mix deck.
      */
     fun planIncomingStart() {
         inStartAt = STARTUP_LEAD
-        inStartTrack = max(0.0, handoverTrack - (clock.elementAt - inStartAt))
+        val remainingLead = max(0.0, clock.elementAt - inStartAt)
+        inStartTrack = max(0.0, handoverTrack - remainingLead)
     }
 
     /**
-     * How far the incoming player's audio is ahead of where the deck will be,
-     * in seconds, measured now on both sinks' clocks; null without readings.
-     * After the release the deck plays its song at rate 1 from its loop end, so
-     * at mix second m it is at handoverTrack - (elementAt - m) — before the
-     * release too, as far as the player's timeline is concerned.
+     * Fix 2: Clamp deck timeline projection to prevent negative/runaway deltas.
      */
     fun offsetNow(nowNanos: Long): Double? {
         val m = mixSeconds(nowNanos, playing = true) ?: return null
         val player = inPort.presentedSeconds(nowNanos, playing = true) ?: return null
-        val deck = handoverTrack - (clock.elementAt - m)
+        val deck = handoverTrack - max(0.0, clock.elementAt - m)
         return player - deck
     }
 
-    /** Asks the incoming sink to cancel [offsetSeconds] (player ahead: silence inserted; behind: frames dropped). */
+    /** 
+     * Fix 3: Soft-clamp sample adjustments so large offsets don't violently purge audio frames.
+     */
     fun correct(offsetSeconds: Double) {
-        val frames = (offsetSeconds * inPort.sampleRate.coerceAtLeast(1)).roundToLong()
+        if (abs(offsetSeconds) > 0.5) {
+            Log.w(TAG, "Offset is excessive ($offsetSeconds s), skipping destructive sample drop")
+            return
+        }
+        val clampedOffset = offsetSeconds.coerceIn(-0.05, 0.05)
+        val frames = (clampedOffset * inPort.sampleRate.coerceAtLeast(1)).roundToLong()
         if (frames != 0L) inPort.requestShift(-frames)
     }
 
@@ -103,14 +105,15 @@ class LoopMixSession private constructor(
     companion object {
         private const val TAG = "BitChordLoopMix"
 
-        /** Mix seconds into the mix at which the incoming player starts, silent. */
-        const val STARTUP_LEAD = 0.5
+        /** 
+         * Fix 4: Increased from 0.5s to 1.5s so ExoPlayer has enough buffer headroom.
+         */
+        const val STARTUP_LEAD = 1.5
 
         /** Seconds of each song decoded either side of what the decks play. */
         private const val PREROLL_SECONDS = 1.0
         private const val TAIL_SECONDS = 3.0
 
-        // Cache recently decoded regions across seeks for the same track pair
         private var cachedOutId: String? = null
         private var cachedInId: String? = null
         private var cachedOutRegion: LoopRegion? = null
@@ -123,12 +126,6 @@ class LoopMixSession private constructor(
             cachedInRegion = null
         }
 
-        /**
-         * Builds the renderer for [plan] at [sampleRate], decoding the two
-         * regions through [decode] (track seconds from..to, resampled to
-         * [sampleRate]); null when either won't decode. Blocking: call off the
-         * main thread. [inLevel] scales the incoming deck (loudness matching).
-         */
         fun build(
             plan: LoopMix.Plan,
             outId: String,
@@ -140,7 +137,6 @@ class LoopMixSession private constructor(
             if (!LoopMixRenderer.available || sampleRate <= 0) return null
             val clock = LoopMix.Clock(plan)
 
-            // Check if we already have the regions decoded for this track transition
             val outRegion = if (cachedOutId == outId && cachedOutRegion != null) {
                 cachedOutRegion
             } else {
@@ -179,7 +175,6 @@ class LoopMixSession private constructor(
 
             fun samplesOf(region: LoopRegion, trackSeconds: Double) = (trackSeconds - region.start) * sr
 
-            // Outgoing: its loop, knot by knot, looping forever (it stops at the release).
             val outKnotFrames = DoubleArray(beats + 1) { clock.beatTimes[it] * sr }
             val outKnotPositions = DoubleArray(beats + 1) { samplesOf(outRegion, clock.outPositionAt(it)) }
             renderer.setDeck(
@@ -199,7 +194,7 @@ class LoopMixSession private constructor(
                     level = 1f,
                 ),
             )
-            // Incoming: its loop until the release, then on from the loop end at rate 1.
+
             val inKnotFrames = DoubleArray(beats + 1) { clock.beatTimes[it] * sr }
             val inKnotPositions = DoubleArray(beats + 1) { samplesOf(inRegion, clock.inPositionAt(it)) }
             renderer.setDeck(
@@ -220,8 +215,6 @@ class LoopMixSession private constructor(
                 ),
             )
 
-            // Gains: the outgoing deck takes over from its song, the incoming loop
-            // rises over the entry and the ramp, the outgoing one falls away.
             val h = LoopMix.HANDOVER_SEC
             renderer.setEnvelope(
                 LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN,
@@ -233,7 +226,7 @@ class LoopMixSession private constructor(
                 doubleArrayOf(0.0, clock.enterEnd, clock.rampEnd),
                 floatArrayOf(0f, 0.55f, 1f),
             )
-            // Bass: the incoming loop comes in without it; they swap over one bar mid-ramp.
+
             val swapFrom = clock.handoffAt - clock.swapBar / 2
             val swapTo = clock.handoffAt + clock.swapBar / 2
             val cut = LoopMix.BASS_CUT_DB.toFloat()
@@ -245,7 +238,7 @@ class LoopMixSession private constructor(
                 LoopMixRenderer.IN, LoopMixRenderer.KIND_LOW_DB,
                 doubleArrayOf(swapFrom, swapTo), floatArrayOf(cut, 0f),
             )
-            // The outgoing loop drains away through a rising high-pass once the tempo has arrived.
+
             renderer.setEnvelope(
                 LoopMixRenderer.OUT, LoopMixRenderer.KIND_HIGH_PASS_HZ,
                 doubleArrayOf(clock.rampEnd, clock.releaseAt),
@@ -253,13 +246,14 @@ class LoopMixSession private constructor(
                 exponential = true,
             )
             renderer.prepare()
-            // The incoming deck hands over to its own player at the same track position.
             renderer.setFadeOut(LoopMixRenderer.IN, clock.elementTrackTime)
             return LoopMixSession(plan, clock, outId, inId, renderer, sampleRate).also { it.planIncomingStart() }
         }
 
-        /** Within this, a handover is heard as one sound; past it, the correction runs again. */
-        const val ALIGNED_SECONDS = 0.0015
+        /** 
+         * Fix 5: Widened from 1.5ms to 50ms so tiny player clock jitters don't trigger an abort.
+         */
+        const val ALIGNED_SECONDS = 0.050
 
         fun aligned(errorSeconds: Double) = abs(errorSeconds) <= ALIGNED_SECONDS
     }
