@@ -110,6 +110,19 @@ class LoopMixSession private constructor(
         private const val PREROLL_SECONDS = 1.0
         private const val TAIL_SECONDS = 3.0
 
+        // Cache recently decoded regions across seeks for the same track pair
+        private var cachedOutId: String? = null
+        private var cachedInId: String? = null
+        private var cachedOutRegion: LoopRegion? = null
+        private var cachedInRegion: LoopRegion? = null
+
+        fun clearCache() {
+            cachedOutId = null
+            cachedInId = null
+            cachedOutRegion = null
+            cachedInRegion = null
+        }
+
         /**
          * Builds the renderer for [plan] at [sampleRate], decoding the two
          * regions through [decode] (track seconds from..to, resampled to
@@ -126,20 +139,39 @@ class LoopMixSession private constructor(
         ): LoopMixSession? {
             if (!LoopMixRenderer.available || sampleRate <= 0) return null
             val clock = LoopMix.Clock(plan)
-            val outRegion = decode(
-                LoopMix.Side.OUT,
-                plan.out.loopStart - PREROLL_SECONDS,
-                plan.out.loopEnd + 0.5,
-            ) ?: return null
-            val inRegion = decode(
-                LoopMix.Side.IN,
-                plan.inn.loopStart - PREROLL_SECONDS,
-                clock.elementTrackTime + TAIL_SECONDS,
-            ) ?: return null
+
+            // Check if we already have the regions decoded for this track transition
+            val outRegion = if (cachedOutId == outId && cachedOutRegion != null) {
+                cachedOutRegion
+            } else {
+                decode(
+                    LoopMix.Side.OUT,
+                    plan.out.loopStart - PREROLL_SECONDS,
+                    plan.out.loopEnd + 0.5,
+                )?.also {
+                    cachedOutId = outId
+                    cachedOutRegion = it
+                }
+            } ?: return null
+
+            val inRegion = if (cachedInId == inId && cachedInRegion != null) {
+                cachedInRegion
+            } else {
+                decode(
+                    LoopMix.Side.IN,
+                    plan.inn.loopStart - PREROLL_SECONDS,
+                    clock.elementTrackTime + TAIL_SECONDS,
+                )?.also {
+                    cachedInId = inId
+                    cachedInRegion = it
+                }
+            } ?: return null
+
             if (outRegion.start > plan.out.loopStart || inRegion.start > plan.inn.loopStart) {
                 Log.w(TAG, "a region starts after its loop: out ${outRegion.start}, in ${inRegion.start}")
                 return null
             }
+
             val renderer = LoopMixRenderer(sampleRate)
             if (!renderer.isValid) return null
             val sr = sampleRate.toDouble()
