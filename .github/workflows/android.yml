@@ -26,15 +26,12 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build Android App (Debug)
-        run: ./gradlew :app:assembleDebug --stacktrace
+      - name: Build Android App (Prod Debug)
+        run: ./gradlew :app:assembleProdDebug --stacktrace
 
-      - name: List generated APKs
-        run: find app/build/outputs/apk -name "*.apk"
-
-      - name: Upload APK
+      - name: Upload Single APK
         uses: actions/upload-artifact@v4
         with:
           name: bitchord-patched-apk
-          path: app/build/outputs/apk/**/*.apk
+          path: app/build/outputs/apk/prod/debug/*.apk
           if-no-files-found: error
