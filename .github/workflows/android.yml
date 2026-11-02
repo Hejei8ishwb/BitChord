@@ -29,8 +29,12 @@ jobs:
       - name: Build Android App (Debug)
         run: ./gradlew :app:assembleDebug --stacktrace
 
+      - name: List generated APKs
+        run: find app/build/outputs/apk -name "*.apk"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: bitchord-patched-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
